@@ -1,0 +1,149 @@
+[
+  {
+    "ticker": "SPY",
+    "is_anchor": true,
+    "anchor_type": "EQUITY",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "QQQ",
+    "is_anchor": true,
+    "anchor_type": "EQUITY",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "IWM",
+    "is_anchor": true,
+    "anchor_type": "EQUITY",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "DIA",
+    "is_anchor": true,
+    "anchor_type": "EQUITY",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "EEM",
+    "is_anchor": true,
+    "anchor_type": "EQUITY",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "TLT",
+    "is_anchor": true,
+    "anchor_type": "BONDS",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "IEF",
+    "is_anchor": true,
+    "anchor_type": "BONDS",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "HYG",
+    "is_anchor": true,
+    "anchor_type": "BONDS",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "GLD",
+    "is_anchor": true,
+    "anchor_type": "COMMOD",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "SLV",
+    "is_anchor": true,
+    "anchor_type": "COMMOD",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "USO",
+    "is_anchor": true,
+    "anchor_type": "COMMOD",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "CPER",
+    "is_anchor": true,
+    "anchor_type": "COMMOD",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "DX-Y.NYB",
+    "is_anchor": true,
+    "anchor_type": "CURR",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "EURUSD=X",
+    "is_anchor": true,
+    "anchor_type": "CURR",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "GBPUSD=X",
+    "is_anchor": true,
+    "anchor_type": "CURR",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "USDJPY=X",
+    "is_anchor": true,
+    "anchor_type": "CURR",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "BTC-USD",
+    "is_anchor": true,
+    "anchor_type": "CRYPTO",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "ETH-USD",
+    "is_anchor": true,
+    "anchor_type": "CRYPTO",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "XRP-USD",
+    "is_anchor": true,
+    "anchor_type": "CRYPTO",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "SOL-USD",
+    "is_anchor": true,
+    "anchor_type": "CRYPTO",
+    "added": "2026-05-19",
+    "reason": "Regime anchor"
+  },
+  {
+    "ticker": "^VIX",
+    "is_anchor": true,
+    "anchor_type": "RISK",
+    "added": "2026-05-06",
+    "reason": "Regime anchor"
+  }
+]

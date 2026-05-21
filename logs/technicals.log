@@ -1,0 +1,35 @@
+$BRUN: possibly delisted; no price data found  (period=1y)
+$BRUN: possibly delisted; no price data found  (period=2y)
+
+1 Failed download:
+['BRUN']: possibly delisted; no price data found  (period=2y)
+$QUCY: possibly delisted; no price data found  (period=2y)
+
+1 Failed download:
+['QUCY']: possibly delisted; no price data found  (period=2y)
+$RKLB: possibly delisted; no price data found  (period=1y)
+$RKLB: possibly delisted; no price data found  (period=2y)
+
+1 Failed download:
+['RKLB']: possibly delisted; no price data found  (period=2y)
+$RKLB: possibly delisted; no price data found  (period=5y)
+
+1 Failed download:
+['RKLB']: possibly delisted; no price data found  (period=5y)
+$SNAL: possibly delisted; no price data found  (period=5y)
+
+1 Failed download:
+['SNAL']: possibly delisted; no price data found  (period=5y)
+Pulling technicals for 12 ticker(s)...
+  BRUN      SKIP (no data)
+  CBRS      $303.63  52w%=-2.4  RSI D/W/M=5.6/None/None
+  CSCO      $115.38  52w%=-2.9  RSI D/W/M=79.4/81.6/88.6
+  CVS       $94.18  52w%=-4.0  RSI D/W/M=68.6/68.5/65.4
+  HIMX      $19.29  52w%=-6.7  RSI D/W/M=67.4/83.2/76.4
+  HPE       $32.62  52w%=-4.4  RSI D/W/M=66.5/77.3/73.9
+  MNST      $86.35  52w%=-2.5  RSI D/W/M=66.2/65.4/67.9
+  QUCY      $2.52  52w%=-27.2  RSI D/W/M=69.9/69.9/59.6
+  RKLB      SKIP (no data)
+  SATL      $9.42  52w%=-4.3  RSI D/W/M=64.8/72.7/72.9
+  SNAL      $1.11  52w%=-34.7  RSI D/W/M=63.8/60.2/63.8
+  WES       $47.07  52w%=-0.5  RSI D/W/M=77.0/76.1/78.3

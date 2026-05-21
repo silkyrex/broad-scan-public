@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage:
+#   locker                              - show locker room in zones: OPEN | VALID | WATCH | DROP | NO SIGNAL
+#                                         OPEN = active positions (from positions table)
+#                                         VALID = green hold/reclaim (wait for entry trigger)
+#                                         WATCH = exit-d1, yellow (one more day before drop)
+#                                         DROP = exit-d2, bold red + ready-to-run `locker del` command
+#                                         NO SIGNAL = no eod data yet
+#                                         ● = research brief exists in ~/research/data/briefs/
+#   locker show|list|ls                 - same as above
+#   locker add TICKER [reason] [SECTOR] - add ticker (fires research automatically)
+#   locker del TICKER                   - remove ticker (with confirmation)
+#   locker brief TICKER                 - open research brief for a ticker
+#   locker size TICKER                  - show sizing verdict from brief (FULL-SIZE / PILOT ONLY)
+#   locker publish TICKER               - generate Substack publish plan for a brief
+#   locker stale [N] [drop]             - show names ≥N days (default 7) with no reclaim; drop to batch-remove
+#   locker pending                      - show multi-hit pending review queue from droplet
+#   locker reclaim                      - show 4 EMA reclaim status for all locker names
+#   locker technicals [TICKER]          - refresh technicals via broad-scan (python3 -m locker.cli pull); one ticker or all
+#                                         auto-runs at 6:00 AM PT via launchd (com.your-org.locker-technicals)
+#                                         trust signal: "technicals: YYYY-MM-DD HH:MM" shown in locker show header
+#                                         stp:+X% in OPEN rows = stop cushion (price above stop), NOT gain from entry
+#   locker prospects                     - live intraday EMA4 for all active prospects (tape, price, EMA4%, RSI-D/W, status)
+#                                         uses today's partial bar (yfinance 2d) -- NOT yesterday's close
+#                                         writes timestamped snapshot to intraday_signals on each run
+#                                         eod_signals untouched; run anytime during market hours
+
+RESEARCH_DIR="$HOME/research/data/briefs"
+
+LOCKER_DB="$HOME/broad-scan/broad-scan.db"
+BROAD_SCAN_DIR="$HOME/broad-scan"
+ANCHORS_JSON="$HOME/broad-scan/config/regime_anchors.json"
+DEMOTED_JSON="$HOME/projects/_archive/do-infra-local-2026-05-14/trading/demoted.json"
+HOLD_JSON="$HOME/projects/_archive/do-infra-local-2026-05-14/trading/value_hold.json"
+BROAD_SCAN_DB="/opt/broad-scan/broad-scan.db"
+CMD="${1:-}"
+
+_la() {
+  locker-actionables --locker "$LOCKER_DB" "$@"
+}
+
+_bs() {
+  cd "$BROAD_SCAN_DIR" && python3 -m locker.cli "$@"
+}
+
+_locker_count() {
+  sqlite3 "$LOCKER_DB" "SELECT count(*) FROM locker_room WHERE status != 'removed';" 2>/dev/null || echo '?'
+}
+
+_sync() {
+  : # do-infra-local archived; sync handled by locker sync (locker-sync script)
+}
+
+_reclaim_check() {
+  local ticker="$1"
+  python3 -W ignore -c "
+import sys
+sys.path.insert(0, '$HOME/projects/do-infra-local/trading')
+from data import get_daily_bars, get_live_price, calculate_ema
+import pandas as pd
+bars = get_daily_bars('$ticker', lookback_days=15)
+if bars is None or len(bars) < 6:
+    print('UNKNOWN'); exit()
+closes = pd.Series(bars['close'].values.flatten(), dtype=float)
+ema4 = calculate_ema(closes)
+live = get_live_price('$ticker')
+price = live if live else float(closes.values[-1])
+today_ema = float(ema4.values[-1])
+yesterday_ema = float(ema4.values[-2])
+prev_close = float(closes.values[-2])
+prev_ema = float(ema4.values[-2])
+if today_ema > yesterday_ema and prev_close < prev_ema and price > today_ema:
+    print('RECLAIM')
+elif price > today_ema:
+    print('ABOVE')
+else:
+    print('BELOW')
+" 2>/dev/null || echo 'UNKNOWN'
+}
+
+_del_batch() {
+  local tickers=("$@")
+  local today
+  today=$(date +%Y-%m-%d)
+  for t in "${tickers[@]}"; do
+    _la del "$t" 2>/dev/null || true
+    sqlite3 "$LOCKER_DB" "INSERT INTO locker_history (ticker, event, date, reason) VALUES ('$t', 'exited', '$today', 'STALE_DROP');" 2>/dev/null || true
+    echo "  Removed $t"
+  done
+  _sync "locker: stale drop (${#tickers[@]} names)"
+}
+
+_add_hold() {
+  local ticker reason today
+  ticker=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+  reason="${2:-}"
+  today=$(date +%Y-%m-%d)
+  if [[ -z "$ticker" ]]; then
+    echo "Usage: locker add TICKER --hold [\"reason\"]"
+    exit 1
+  fi
+  [[ -f "$HOLD_JSON" ]] || echo '[]' > "$HOLD_JSON"
+  if jq -e --arg t "$ticker" 'any(.[]; .ticker == $t)' "$HOLD_JSON" > /dev/null 2>&1; then
+    echo "$ticker is already in value hold list"
+    exit 0
+  fi
+  jq --arg t "$ticker" --arg r "$reason" --arg d "$today" \
+    '. += [{"ticker": $t, "reason": $r, "added": $d, "strategy": "hold", "sizing": 8, "source": "manual"}]' \
+    "$HOLD_JSON" > /tmp/vh_tmp.json && mv /tmp/vh_tmp.json "$HOLD_JSON"
+  sqlite3 "$LOCKER_DB" "INSERT INTO locker_history (ticker, event, date, reason) VALUES ('$ticker', 'hold_add', '$today', 'HOLD_ADD');" 2>/dev/null || true
+  git -C "$HOME/projects/do-infra-local" add trading/value_hold.json 2>/dev/null || true
+  _sync "locker: hold add $ticker"
+  echo "Added $ticker to value hold (strategy=hold, sizing=8)."
+  echo "  Reason: $reason"
+  echo "  View: locker hold"
+}
+
+_db_to_json() {
+  python3 -c "
+import json, os, sqlite3
+conn = sqlite3.connect('$LOCKER_DB')
+conn.row_factory = sqlite3.Row
+rows = conn.execute('''
+    SELECT lr.ticker,
+           COALESCE(lr.added, lr.promoted_date) AS added,
+           lr.sector, lr.source,
+           COALESCE(lr.scan_signals, '[]') AS scan_signals,
+           lr.notes, lr.bucket, lr.ema4_status,
+           lr.price, lr.w52_high_pct, lr.ath_pct, lr.rsi_d, lr.rsi_w, lr.rsi_m,
+           es.tape, es.rsi_d AS eod_rsi_d, es.rsi_w AS eod_rsi_w, es.toby_status,
+           es.buzz_d, es.buzz_w, es.ema_4e_pct,
+           p.id AS pos_id, p.shares AS pos_shares,
+           p.stop_price AS pos_stop, p.entry_price AS pos_entry,
+           p.entry_date AS pos_entry_date
+    FROM locker_room lr
+    LEFT JOIN eod_signals es
+      ON es.ticker = lr.ticker
+      AND es.signal_date = (
+        SELECT MAX(signal_date) FROM eod_signals WHERE ticker = lr.ticker
+      )
+    LEFT JOIN positions p
+      ON p.ticker = lr.ticker
+      AND p.status = 'open'
+    WHERE lr.status != 'removed'
+    ORDER BY lr.ticker
+''').fetchall()
+brief_dir = os.path.expanduser('$RESEARCH_DIR')
+out = []
+for r in rows:
+    d = dict(r)
+    signals = json.loads(d.get('scan_signals') or '[]')
+    sector = d.get('sector') or ''
+    parts = signals + ([sector] if sector else [])
+    reason = ' | '.join(parts) if parts else ''
+    has_brief = os.path.exists(os.path.join(brief_dir, d['ticker'] + '-deep.md'))
+    out.append({'ticker': d['ticker'], 'added': d['added'], 'sector': sector,
+                'reason': reason, 'source': d.get('source',''), 'has_brief': has_brief,
+                'ema4_status': d.get('ema4_status',''), 'price': d.get('price'),
+                'w52_high_pct': d.get('w52_high_pct'), 'rsi_d': d.get('rsi_d'),
+                'tape': d.get('tape') or '', 'toby_status': d.get('toby_status') or '',
+                'has_position': d.get('pos_id') is not None,
+                'pos_shares': d.get('pos_shares'), 'pos_stop': d.get('pos_stop'),
+                'pos_entry': d.get('pos_entry'), 'pos_entry_date': d.get('pos_entry_date'),
+                'buzz_d': d.get('buzz_d'), 'buzz_w': d.get('buzz_w'),
+                'ema_4e_pct': d.get('ema_4e_pct')})
+conn.close()
+print(json.dumps(out))
+" 2>/dev/null || echo '[]'
+}
+
+_add() {
+  local ticker reason sector today
+  ticker=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]')
+  reason="${2:-}"
+  sector=$(echo "${3:-}" | tr '[:lower:]' '[:upper:]')
+  today=$(date +%Y-%m-%d)
+  if [[ -z "$ticker" ]]; then
+    echo "Usage: locker add TICKER [\"reason\"] [SEMI|AI|OPTICAL|INDUS|TECH|ENERGY|FINANCE|COMMS|AVIATION|HEALTH|CONS]"
+    exit 1
+  fi
+  if [[ -n "$sector" ]] && [[ ! "$sector" =~ ^(SEMI|AI|OPTICAL|INDUS|TECH|ENERGY|FINANCE|COMMS|AVIATION|HEALTH|CONS)$ ]]; then
+    echo "Unknown sector: $sector"
+    echo "Valid: SEMI AI OPTICAL INDUS TECH ENERGY FINANCE COMMS AVIATION HEALTH CONS"
+    exit 1
+  fi
+  if [[ -f "$ANCHORS_JSON" ]] && jq -e --arg t "$ticker" 'any(.[]; .ticker == $t)' "$ANCHORS_JSON" > /dev/null 2>&1; then
+    echo "BLOCKED: $ticker is a regime anchor (SPY/QQQ/IWM etc). Use 'locker regime' to view regime names."
+    exit 1
+  fi
+  _reclaim=$(_reclaim_check "$ticker")
+  _source="manual"
+
+  # Write to broad-scan.db:locker_room (canonical locker store)
+  _bs_args=(add "$ticker" --source "$_source")
+  [[ -n "$sector" ]] && _bs_args+=(--sector "$sector")
+  [[ -n "$reason" ]] && _bs_args+=(--notes "$reason")
+  _bs "${_bs_args[@]}"
+
+  # Pull technicals (price, RSI, 52w%, ATH%, SMAs)
+  _bs pull "$ticker"
+
+  # Async research trigger -- fires managed agent in background, Discord NEW ping ~60s
+  if command -v research >/dev/null 2>&1; then
+    research run "$ticker" &
+  fi
+
+  case "$_reclaim" in
+    RECLAIM) echo "  ✓ Active reclaim -- trigger agent is live on this name" ;;
+    ABOVE)   echo "  ↑ Above 4 EMA, no crossover yet -- watch for retest + reclaim" ;;
+    BELOW)   echo "  ↓ Below 4 EMA -- no setup yet, watching for next signal" ;;
+    *)       echo "  ? Reclaim status unknown" ;;
+  esac
+  _sync "locker: add $ticker"
+  echo "  → Run 'locker sync' to push to StockCharts + TradingView"
+}
+
+case "$CMD" in
+  "")
+    _positions='{}'
+    _signals='{}'
+    _last_qual='{}'
+    _pos_file=$(mktemp)
+    _sig_file=$(mktemp)
+    _prc_file=$(mktemp)
+    _lq_file=$(mktemp)
+    _anc_file=$(mktemp)
+    _momentum_file=$(mktemp)
+    printf '%s' "$_positions" > "$_pos_file"
+    printf '%s' "$_signals"   > "$_sig_file"
+    printf '%s' "$_last_qual" > "$_lq_file"
+    trap "rm -f $_pos_file $_sig_file $_prc_file $_lq_file $_anc_file $_momentum_file" EXIT
+    _today=$(date +%Y-%m-%d)
+    _db_to_json > "$_momentum_file"
+
+    _tickers=$(jq -r '.[].ticker' "$_momentum_file" | tr '\n' ' ')
+    python3 -W ignore -c "
+import yfinance as yf, json, warnings
+warnings.filterwarnings('ignore')
+tickers = '$_tickers'.strip().split()
+out = {}
+try:
+    if len(tickers) == 1:
+        h = yf.Ticker(tickers[0]).history(period='2d')
+        c, p = float(h['Close'].iloc[-1]), float(h['Close'].iloc[-2])
+        if p > 0:
+            out[tickers[0]] = {'price': round(c, 2), 'pct': round((c - p) / p * 100, 2)}
+    elif tickers:
+        data = yf.download(tickers, period='2d', progress=False, auto_adjust=True)
+        close = data['Close']
+        for t in tickers:
+            try:
+                c, p = float(close[t].iloc[-1]), float(close[t].iloc[-2])
+                if p > 0:
+                    out[t] = {'price': round(c, 2), 'pct': round((c - p) / p * 100, 2)}
+            except:
+                pass
+except:
+    pass
+print(json.dumps(out))
+" 2>/dev/null > "$_prc_file" || echo '{}' > "$_prc_file"
+
+    python3 -W ignore -c "
+import json, warnings
+warnings.filterwarnings('ignore')
+try:
+    import yfinance as yf
+    anchors = json.load(open('$ANCHORS_JSON'))
+    if not anchors: print('{}'); exit()
+    tickers = [a['ticker'] for a in anchors]
+    anchor_map = {a['ticker']: a for a in anchors}
+    if len(tickers) == 1:
+        closes_map = {tickers[0]: yf.Ticker(tickers[0]).history(period='30d')['Close'].dropna().astype(float)}
+    else:
+        dl = yf.download(tickers, period='30d', progress=False, auto_adjust=True, group_by='ticker')
+        closes_map = {}
+        for t in tickers:
+            try: closes_map[t] = dl[t]['Close'].dropna().astype(float)
+            except: pass
+    out = {}
+    for t, closes in closes_map.items():
+        try:
+            if len(closes) < 5: continue
+            ema4 = closes.ewm(span=4, adjust=False).mean()
+            price = float(closes.iloc[-1]); prev = float(closes.iloc[-2])
+            pct = round((price - prev) / prev * 100, 2) if prev > 0 else 0.0
+            ema4_last = float(ema4.iloc[-1]); ema4_prev = float(ema4.iloc[-2])
+            out[t] = {'price': round(price,2), 'pct': pct,
+                      'ema4_above': price > ema4_last,
+                      'ema4_slope': ema4_last > ema4_prev,
+                      'anchor_type': anchor_map.get(t,{}).get('anchor_type','')}
+        except: pass
+    print(json.dumps(out))
+except: print('{}')
+" 2>/dev/null > "$_anc_file" || echo '{}' > "$_anc_file"
+
+    _reason_filter='(.reason // ""
+        | gsub(" \\(At Close\\)"; "") | gsub(" \\(At Open\\)"; "") | gsub("ATH \\| ATH"; "ATH")
+        | gsub("SCTR \\((?<n>[0-9]+) cats / (?<d>[0-9]+) dates\\)"; if (.d|tonumber) >= 3 then "SCTR+" else "SCTR" end)
+        | gsub("SCTR (?<n>[0-9]+)c/(?<d>[0-9]+)d"; if (.d|tonumber) >= 3 then "SCTR+" else "SCTR" end)
+        | gsub(" \\|  \\| "; " | ") | gsub(" \\|  \\| "; " | ")
+      ) as $r |
+      ($r | split(" | ")) as $parts |
+      ($parts[:-1] | join(" | ")) as $sigs |
+      $parts[-1] as $sect'
+
+    _pnl='($prc[0][.ticker] // null) as $q |
+      (if $q == null then "—"
+       elif ((.pos_shares // 0) > 0 and (.pos_entry // 0) > 0) then
+         ((.pos_shares * ($q.price - .pos_entry))) as $d |
+         (((($q.price - .pos_entry) / .pos_entry * 100) * 100 | round) / 100) as $dpct |
+         (if $d >= 0 then "+" else "-" end) + "$" + ($d | fabs | floor | tostring) + " " + (if $dpct >= 0 then "+" else "" end) + ($dpct | tostring) + "%"
+       else (if $q.pct >= 0 then "+" else "" end) + ($q.pct | tostring) + "%"
+       end) as $pnl'
+
+    open=$(jq -r --slurpfile sig "$_sig_file" --slurpfile prc "$_prc_file" '
+      [ .[] |
+        '"$_reason_filter"' |
+        select(.has_position == true) |
+        '"$_pnl"' |
+        (if .pos_stop != null and .pos_entry != null and .pos_stop > 0
+            and .pos_entry > .pos_stop and $q != null then
+          (($q.price - .pos_entry) / (.pos_entry - .pos_stop)) as $r_raw |
+          (if $r_raw >= 0 then "+" else "" end) + (($r_raw * 10 | round) / 10 | tostring) + "R"
+        else "—" end) as $r_display |
+        (if (.pos_shares // 0) > 0 and (.pos_entry // 0) > 0 and $q != null then
+          (((($q.price - .pos_entry) / .pos_entry * 100) * 100 | round) / 100) as $dpct |
+          (if $dpct >= 0 then "+" else "" end) + ($dpct | tostring) + "%"
+        else "—" end) as $pnl_pct |
+        (if $q != null and ((.pos_stop // 0) > 0) then
+           (($q.price - .pos_stop) / .pos_stop * 100) as $sd |
+           "stp " + (if $sd >= 0 then "+" else "" end) + (($sd * 10 | round) / 10 | tostring) + "%"
+         else "—" end) as $stop_dist |
+        (if .pos_entry_date != null then
+           (((now | floor) - (.pos_entry_date + "T00:00:00Z" | fromdateiso8601)) / 86400 | floor | tostring) + "d"
+         else "" end) as $days_held |
+        {line: "\(.ticker)\t[OPEN \(.pos_shares | floor | tostring)sh]\t\($r_display)\t\($pnl_pct)\t\($stop_dist)\t\(if (.has_brief // false) then "B" else "" end)\t\($days_held)",
+         key: ($prc[0][.ticker].pct // 0)}
+      ] | sort_by(.key) | reverse | .[].line
+    ' "$_momentum_file")
+
+    fresh=$(jq -r --slurpfile sig "$_sig_file" --slurpfile prc "$_prc_file" --slurpfile lq "$_lq_file" --arg today "$_today" '
+      [ .[] |
+        ($sig[0][.ticker] // null) as $reclaim |
+        '"$_reason_filter"' |
+        select(.has_position != true) |
+        ($prc[0][.ticker].price // null) as $lp |
+        (if .ema_4e_pct != null and .price != null and .price > 0 and $lp != null then
+          (.price / (1 + .ema_4e_pct / 100)) as $ema4_abs |
+          (($lp - $ema4_abs) / $ema4_abs * 100)
+        else .ema_4e_pct end) as $live_ema4_raw |
+        (if $live_ema4_raw != null and $live_ema4_raw > 0 and (.toby_status // "") == "exit-d1" then "↑" else "" end) as $reclaim_flag |
+        (if $reclaim != null then "[RECLAIM]"
+         else
+           (((now - (.added + "T00:00:00Z" | fromdateiso8601)) / 86400 | floor) | tostring) as $days |
+           "[" + $days + "d]"
+           + (if ($lq[0][.ticker] // "") == $today then " ★" else "" end)
+         end) as $state |
+        '"$_pnl"' |
+        ($live_ema4_raw | if . != null then
+          (if . >= 0 then "^" else "v" end) + (((((if . < 0 then -. else . end) * 10 | round) / 10)) | tostring)
+        else "" end) as $ema_pct |
+        (.rsi_d // null | if . != null then "r" + (. | round | tostring) else "" end) as $rsi_label |
+        (.w52_high_pct // null | if . != null then
+          (if . >= 0 then "+" else "" end) + ((. * 10 | round) / 10 | tostring) + "%h"
+        else "" end) as $w52_pct |
+        (.buzz_w // null | if . != null and (. | floor) > 50 then "buzz×" + (. | floor | tostring) else "" end) as $buzz_label |
+        (
+          (if $live_ema4_raw != null then
+            if   $live_ema4_raw <  0  then -5
+            elif $live_ema4_raw <= 1  then  1
+            elif $live_ema4_raw <= 10 then  3
+            elif $live_ema4_raw <= 15 then  0
+            else -2 end
+          else 0 end) +
+          (if .rsi_d != null then
+            if   .rsi_d >= 60 and .rsi_d <= 75 then  2
+            elif .rsi_d >= 50 and .rsi_d <  60 then  1
+            elif .rsi_d >  75 and .rsi_d <= 80 then  0
+            else -1 end
+          else 0 end) +
+          (if .w52_high_pct != null then
+            if   .w52_high_pct >= -10 then  2
+            elif .w52_high_pct >= -20 then  1
+            elif .w52_high_pct >= -30 then  0
+            else -1 end
+          else 0 end)
+        ) as $setup_score |
+        {line: "\(.ticker)\t\($reclaim_flag)\t\($state)\t\($ema_pct)\t\($pnl)\t\($rsi_label)\t\($w52_pct)\t\($buzz_label)\t\(.toby_status // "")",
+         key: $setup_score}
+      ] | sort_by(.key) | reverse | .[].line
+    ' "$_momentum_file")
+
+    closed=$(jq -r --slurpfile pos "$_pos_file" --slurpfile sig "$_sig_file" --slurpfile prc "$_prc_file" '
+      [ .[] |
+        ($pos[0][.ticker] // null) as $p |
+        '"$_reason_filter"' |
+        select($p != null and $p.state == "closed") |
+        '"$_pnl"' |
+        {line: "\(.ticker)\t[CLOSED]\t\($pnl)\t\t\(.sector // "")\t\($sigs)\t\(if (.has_brief // false) then "B" else "" end)",
+         key: ($prc[0][.ticker].pct // 0)}
+      ] | sort_by(.key) | reverse | .[].line
+    ' "$_momentum_file")
+
+    _align() {
+      awk -F'\t' '
+        function clr(s, code,   r) { r = code s "\033[0m"; return r }
+        function vlen(s,   tmp)    { tmp = s; gsub(/\033\[[0-9;]*m/, "", tmp); return length(tmp) }
+        function pad(s, w,   i, r) { r = s; for (i = vlen(s); i < w; i++) r = r " "; return r }
+        {
+          if ($2 ~ /OPEN/) {
+            c1 = pad(clr($1, "\033[1m"), 8)
+            # OPEN ROW: ticker | [Xsh] | R | day% | stop | brief | days
+
+            # col2: share count — strip OPEN, yellow
+            tmp = $2; sub(/OPEN /, "", tmp)
+            c2 = pad(clr(tmp, "\033[1;33m"), 10)
+
+            # col3: R multiple — green if +, red if -
+            if      ($3 ~ /^\+/) c3 = pad(clr($3, "\033[32m"),  8)
+            else if ($3 ~ /^-/)  c3 = pad(clr($3, "\033[31m"),  8)
+            else                 c3 = pad(clr($3, "\033[2m"),    8)
+
+            # col4: day % — bold bright on big moves
+            ptmp = $4; gsub(/[^0-9.]/, "", ptmp); pval = ptmp + 0
+            if      ($4 ~ /^\+/) c4 = pad(clr($4, (pval >= 5 ? "\033[1;92m" : "\033[32m")), 10)
+            else if ($4 ~ /^-/)  c4 = pad(clr($4, (pval >= 5 ? "\033[1;91m" : "\033[31m")), 10)
+            else                 c4 = pad($4, 10)
+
+            # col5: stop cushion
+            if ($5 == "" || $5 == "—") {
+              c5 = pad(clr($5, "\033[2m"), 12)
+            } else if ($5 ~ /-[0-9]/) {
+              c5 = pad(clr($5, "\033[1;31m"), 12)
+            } else {
+              stmp = $5; gsub(/[^0-9.]/, "", stmp); spct = stmp + 0
+              if      (spct >= 5) c5 = pad(clr($5, "\033[32m"),  12)
+              else if (spct >= 2) c5 = pad(clr($5, "\033[33m"),  12)
+              else                c5 = pad(clr($5, "\033[31m"),  12)
+            }
+
+            # col6: brief indicator
+            c6 = ($6 == "B") ? clr("●", "\033[32m") : pad("", 2)
+
+            # col7: days held — dim trailing
+            c7 = $7 != "" ? clr($7, "\033[2m") : ""
+
+            printf "%s  %s  %s  %s  %s  %s  %s\n", c1, c2, c3, c4, c5, c6, c7
+
+          } else {
+            # FRESH ROW: ticker | flag | state | EMA4e | day% | rsi | 52w%h | buzz
+
+            # ticker: bold, width 4 — pure ASCII, pad() works correctly
+            c1 = pad(clr($1, "\033[1m"), 4)
+
+            # flag: ↑ yellow or space — never padded (avoids UTF-8 byte count issue)
+            cflag = $2 != "" ? clr($2, "\033[33m") : " "
+
+            # state: zone-based color from toby_status ($9)
+            if      ($3 ~ /RECLAIM/)                                 c2 = pad(clr($3, "\033[1;32m"), 12)
+            else if ($3 ~ /^\[CLOSED\]/)                             c2 = pad(clr($3, "\033[2m"),    12)
+            else if ($9 == "hold"   || $9 == "reclaim")              c2 = pad(clr($3, "\033[32m"),   12)
+            else if ($9 == "exit-d1")                                c2 = pad(clr($3, "\033[33m"),   12)
+            else if ($9 == "exit-d2")                                c2 = pad(clr($3, "\033[31m"),   12)
+            else                                                     c2 = pad(clr($3, "\033[2m"),    12)
+
+            # EMA4 — ^N=above (green), vN=below (red)
+            etmp = $4; gsub(/[^0-9.]/, "", etmp); epct = etmp + 0
+            if      ($4 == "")       c3 = pad("", 7)
+            else if ($4 ~ /^v/)      c3 = pad(clr($4, "\033[31m"),    7)
+            else if (epct <= 2)      c3 = pad(clr($4, "\033[1;32m"),  7)
+            else                     c3 = pad(clr($4, "\033[2;32m"),  7)
+
+            # day % — bold bright on big moves
+            ptmp = $5; gsub(/[^0-9.]/, "", ptmp); pval = ptmp + 0
+            if      ($5 ~ /^\+/) c4 = pad(clr($5, (pval >= 5 ? "\033[1;92m" : "\033[32m")), 10)
+            else if ($5 ~ /^-/)  c4 = pad(clr($5, (pval >= 5 ? "\033[1;91m" : "\033[31m")), 10)
+            else                 c4 = pad($5, 10)
+
+            # RSI-D — dim gray, compact
+            c5 = $6 != "" ? pad(clr($6, "\033[2m"), 4) : pad("", 4)
+
+            # 52w high pct — dim gray
+            c6 = $7 != "" ? pad(clr($7, "\033[2m"), 8) : pad("", 8)
+
+            # buzz — dim gray trailing
+            c7 = $8 != "" ? clr($8, "\033[2m") : ""
+
+            printf "%s%s  %s  %s  %s  %s  %s  %s\n", c1, cflag, c2, c3, c4, c5, c6, c7
+          }
+        }
+      '
+    }
+
+    _last_run_file="$HOME/broad-scan/logs/technicals-last-run.txt"
+    python3 -W ignore -c "
+import json, os
+try:
+    data = json.load(open('$_anc_file'))
+    if not data: raise ValueError()
+    R='\033[0m'; B='\033[1m'; G='\033[32m'; RED='\033[31m'; D='\033[2m'
+    Y='\033[33m'; BR='\033[1;31m'; BG='\033[1;32m'
+    vix_bands = [(15,G,'LOW'),(20,G,'NORMAL'),(25,Y,'ELEVATED'),(30,Y,'HIGH'),(50,RED,'SPIKE'),(999,BR,'FEAR')]
+    def vix_band(v):
+        for thr,c,n in vix_bands:
+            if v < thr: return c,n
+        return BR,'FEAR'
+    def fmt_tick(t, disp=None):
+        if t not in data: return None
+        d = data[t]; disp = disp or t
+        p = d['pct']; ps = ('+' if p >= 0 else '') + f'{p:.1f}%'
+        pc = G if p >= 0 else RED
+        if not d['ema4_above']:
+            em = RED+'▼'+R
+        elif d.get('ema4_slope', True):
+            em = G+'▲'+R      # above rising EMA -- genuine bull
+        else:
+            em = Y+'▲'+R      # above declining EMA -- bear bounce
+        return f'{B}{disp}{R} {pc}{ps}{R}{em}'
+    equity_tickers = [('SPY','SPY'),('QQQ','QQQ'),('IWM','IWM'),('DIA','DIA')]
+    eq_below    = sum(1 for t,_ in equity_tickers if t in data and not data[t]['ema4_above'])
+    eq_bounce   = sum(1 for t,_ in equity_tickers if t in data and data[t]['ema4_above'] and not data[t].get('ema4_slope', True))
+    if eq_below >= 3:                    rs,rc = 'RISK-OFF', BR
+    elif eq_below == 0 and eq_bounce == 0: rs,rc = 'RISK-ON',  BG
+    elif eq_below == 0 and eq_bounce > 0:  rs,rc = 'BOUNCE',   Y
+    else:                                  rs,rc = 'MIXED',     Y
+    vix_val = data.get('^VIX', {}).get('price', 0)
+    vc,vn = vix_band(vix_val)
+    try:
+        with open('$_last_run_file') as f:
+            lrun = f.read().strip().replace('last_run=','').replace('T',' ')[:16]
+    except: lrun = ''
+    tch = f'  {D}tch {lrun}{R}' if lrun else ''
+    print(f'{D}─── REGIME ──────────────── {rc}{rs}{R}  {vc}VIX {vix_val:.1f} {vn}{R}{tch}')
+    groups = [
+        ('equity', [('SPY','SPY'),('QQQ','QQQ'),('IWM','IWM'),('DIA','DIA')]),
+        ('bonds ', [('TLT','TLT'),('IEF','IEF'),('HYG','HYG')]),
+        ('alts  ', [('GLD','GLD'),('BTC-USD','BTC'),('USO','USO'),('DX-Y.NYB','DXY')]),
+    ]
+    for label, anchors in groups:
+        parts = [fmt_tick(t,d) for t,d in anchors]
+        parts = [p for p in parts if p]
+        if parts:
+            print(f'  {D}{label}{R}  ' + '  '.join(parts))
+    print()
+except Exception as e:
+    print(f'\033[2m─── REGIME ──── fetch failed\033[0m')
+    print()
+" 2>/dev/null
+    _scan_regime=$(cd $HOME/broad-scan && $HOME/.venv/bin/python3 -W ignore bin/regime-check.py 2>/dev/null | grep "Verdict" | grep -oE "BULL|CHOP|BEAR" | tail -1 || true)
+    if [[ "$_scan_regime" == "BULL" ]]; then
+      printf "\033[92m  scan regime: BULL\033[0m\n\n"
+    elif [[ "$_scan_regime" == "CHOP" ]]; then
+      printf "\033[93m  scan regime: CHOP\033[0m\n\n"
+    elif [[ "$_scan_regime" == "BEAR" ]]; then
+      printf "\033[91m  scan regime: BEAR\033[0m\n\n"
+    fi
+    if [[ -n "$open" ]]; then
+      printf "\033[1;33m─── OPEN ──────────────────────────────────\033[0m\n"
+      echo "$open" | _align
+      echo ""
+    fi
+    if [[ -n "$fresh" ]]; then
+      valid=$(echo "$fresh" | awk -F'\t' '$9 == "hold" || $9 == "reclaim"' || true)
+      watch=$(echo "$fresh" | awk -F'\t' '$9 == "exit-d1"' || true)
+      drop=$(echo  "$fresh" | awk -F'\t' '$9 == "exit-d2"' || true)
+      nosig=$(echo "$fresh" | awk -F'\t' '$9 == "" || $9 == "na"' || true)
+      valid_count=$(echo "$valid" | grep -c . 2>/dev/null || echo 0)
+      watch_count=$(echo "$watch" | grep -c . 2>/dev/null || echo 0)
+      drop_count=$(echo  "$drop"  | grep -c . 2>/dev/null || echo 0)
+      nosig_count=$(echo "$nosig" | grep -c . 2>/dev/null || echo 0)
+      drop_tickers=$(echo "$drop" | awk -F'\t' 'NF>0 {print $1}' | tr '\n' ' ' | sed 's/ $//')
+      if [[ -n "$valid" && "$valid_count" -gt 0 ]]; then
+        printf "\033[32m─── VALID (%d) ─── green tape, await reclaim\033[0m\n" "$valid_count"
+        echo "$valid" | _align
+        echo ""
+      fi
+      if [[ -n "$watch" && "$watch_count" -gt 0 ]]; then
+        printf "\033[33m─── WATCH (%d) ─── exit-d1, consider exiting\033[0m\n" "$watch_count"
+        echo "$watch" | _align
+        echo ""
+      fi
+      if [[ -n "$drop" && "$drop_count" -gt 0 ]]; then
+        printf "\033[1;31m─── DROP (%d) ─────────────────────\033[0m\n" "$drop_count"
+        echo "$drop" | _align
+        if [[ -n "$drop_tickers" ]]; then
+          printf "\033[2m  locker del %s\033[0m\n" "$drop_tickers"
+        fi
+        echo ""
+      fi
+      if [[ -n "$nosig" && "$nosig_count" -gt 0 ]]; then
+        printf "\033[2m─── NO SIGNAL (%d) ────────────────\033[0m\n" "$nosig_count"
+        echo "$nosig" | _align
+      fi
+    fi
+    if [[ -n "$closed" ]]; then
+      count=$(echo "$closed" | wc -l | tr -d ' ')
+      echo ""
+      printf "─── CLOSED (%d) ──────────────────\n" "$count"
+      echo "$closed" | _align
+    fi
+    ;;
+
+  add)
+    _HOLD=false
+    _TICKER=""
+    _REASON=""
+    for _arg in "${@:2}"; do
+      if [[ "$_arg" == "--hold" ]]; then
+        _HOLD=true
+      elif [[ -z "$_TICKER" ]]; then
+        _TICKER="$_arg"
+      else
+        _REASON="$_arg"
+      fi
+    done
+    if [[ "$_HOLD" == "true" ]]; then
+      _add_hold "$_TICKER" "$_REASON"
+    else
+      _add "${2:-}" "${3:-}" "${4:-}"
+    fi
+    ;;
+
+  reclaim)
+    _bs reclaim
+    ;;
+
+  clarity)
+    _bs clarity "${@:2}"
+    ;;
+
+  pending)
+    # Query broad-scan DB on droplet for new scan entries in the last 7 days
+    pending=$(ssh tx-01 "sqlite3 $BROAD_SCAN_DB \
+      \"SELECT ticker, GROUP_CONCAT(DISTINCT scan_type) as signals, MAX(scan_date) as last_seen \
+        FROM scans \
+        WHERE is_new_entry=1 AND scan_date >= date('now','-7 days') \
+        GROUP BY ticker \
+        ORDER BY last_seen DESC, COUNT(DISTINCT scan_type) DESC\"" 2>/dev/null)
+    if [[ -z "$pending" ]]; then
+      echo "No new scan entries in the last 7 days (or broad-scan not yet running)."
+    else
+      echo "── New scan entries (last 7d) ──"
+      echo ""
+      printf "%-8s  %-40s  %s\n" "TICKER" "SIGNALS" "LAST SEEN"
+      echo "-------------------------------------------------------------------"
+      while IFS='|' read -r ticker signals last_seen; do
+        printf "%-8s  %-40s  %s\n" "$ticker" "$signals" "$last_seen"
+      done <<< "$pending"
+      echo ""
+      echo "To add to locker:     locker add TICKER"
+      echo "To add to prospects:  cd ~/broad-scan && python -m scanner.cli add-prospect TICKER"
+      echo ""
+      _cg_tickers=$(echo "$pending" | cut -d'|' -f1 | tr '\n' ',' | sed 's/,$//')
+      if [[ -n "$_cg_tickers" ]]; then
+        _cg_url="https://stockcharts.com/freecharts/candleglance.html?${_cg_tickers}|M|p45476262533"
+        echo "  📊 CandleGlance -> $_cg_url"
+        open "$_cg_url" 2>/dev/null || true
+      fi
+    fi
+    ;;
+
+  undel)
+    TICKER=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker undel TICKER"
+      exit 1
+    fi
+    if ! jq -e --arg t "$TICKER" 'any(.[]; .ticker == $t)' "$DEMOTED_JSON" > /dev/null 2>&1; then
+      echo "$TICKER is not in the demoted blocklist."
+      exit 1
+    fi
+    jq --arg t "$TICKER" 'map(select(.ticker != $t))' \
+      "$DEMOTED_JSON" > /tmp/demoted_tmp.json && mv /tmp/demoted_tmp.json "$DEMOTED_JSON"
+    echo "$TICKER removed from demoted blocklist."
+    ;;
+
+  del)
+    TICKER=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker del TICKER"
+      exit 1
+    fi
+    read -r -p "Remove $TICKER from locker room? [y/N] " confirm || confirm=""
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      _bs del "$TICKER"
+      echo "Removed $TICKER. Locker Room: $(_locker_count) tickers."
+      echo "  → Run 'locker sync' to push to StockCharts + TradingView"
+    else
+      echo "Cancelled."
+    fi
+    ;;
+
+  stale)
+    THRESHOLD="${2:-7}"
+    DROP=0
+    [[ "${2:-}" == "drop" ]] && DROP=1 && THRESHOLD=7
+    [[ "${3:-}" == "drop" ]] && DROP=1
+    TODAY=$(date +%Y-%m-%d)
+    _last_qual='{}'
+
+    stale_tickers=()
+    stale_lines=()
+
+    while IFS= read -r entry; do
+      ticker=$(echo "$entry" | jq -r '.ticker')
+      added=$(echo "$entry"  | jq -r '.added')
+      last_qual=$(echo "$_last_qual" | jq -r --arg t "$ticker" '.[$t] // empty')
+      ref_date="${last_qual:-$added}"
+      sector=$(echo "$entry" | jq -r '.sector // ""')
+      days=$(( ( $(date -d "$TODAY" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$TODAY" +%s) \
+               - $(date -d "$ref_date" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$ref_date" +%s) ) / 86400 ))
+      if (( days >= THRESHOLD )); then
+        status=$(_reclaim_check "$ticker")
+        [[ "$status" == "RECLAIM" ]] && continue
+        case "$status" in
+          ABOVE)   label="↑ above EMA, no crossover" ;;
+          BELOW)   label="↓ below 4 EMA" ;;
+          *)       label="? unknown" ;;
+        esac
+        stale_tickers+=("$ticker")
+        stale_lines+=("$(printf '%-6s  [%dd]  %-8s  %s' "$ticker" "$days" "$sector" "$label")")
+      fi
+    done < <(_db_to_json | jq -c '.[]')
+
+    n=${#stale_tickers[@]}
+    if (( n == 0 )); then
+      echo "No stale names (≥${THRESHOLD}d without reclaim)."
+      exit 0
+    fi
+    echo "Stale names (≥${THRESHOLD}d, no active reclaim):"
+    echo ""
+    for line in "${stale_lines[@]}"; do echo "  $line"; done
+    echo ""
+    _cg_tickers=$(IFS=,; echo "${stale_tickers[*]}")
+    _cg_url="https://stockcharts.com/freecharts/candleglance.html?${_cg_tickers}|M|p45476262533"
+    echo "  📊 CandleGlanceDAILY → $_cg_url"
+    open "$_cg_url" 2>/dev/null || true
+    echo ""
+    if (( DROP )); then
+      read -r -p "Drop all $n names? [y/N] " confirm || confirm=""
+      if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        _del_batch "${stale_tickers[@]}"
+      else
+        echo "Cancelled."
+      fi
+    fi
+    ;;
+
+  technicals)
+    TICKER="${2:-}"
+    if [[ -n "$TICKER" ]]; then
+      TICKER=$(echo "$TICKER" | tr '[:lower:]' '[:upper:]')
+      _bs pull "$TICKER"
+    else
+      count=$(_locker_count)
+      echo "Refreshing technicals for $count tickers..."
+      _bs pull
+    fi
+    ;;
+
+  sync)
+    python3 "$HOME/broad-scan/bin/locker-sync" "${@:2}"
+    ;;
+
+  research)
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: locker research TICKER [TICKER ...]"
+      exit 1
+    fi
+    for TICKER in "${@:2}"; do
+      TICKER=$(echo "$TICKER" | tr '[:lower:]' '[:upper:]')
+      research run "$TICKER"
+    done
+    ;;
+
+  earnings)
+    TICKER="${2:-}"
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker earnings TICKER"
+      exit 1
+    fi
+    python3 "$HOME/projects/do-infra-local/research/earnings_agent.py" "$TICKER"
+    ;;
+
+  hold)
+    [[ -f "$HOLD_JSON" ]] || { echo "No value hold list yet."; exit 0; }
+    count=$(jq 'length' "$HOLD_JSON")
+    if (( count == 0 )); then
+      echo "Value hold list is empty. Add with: locker add TICKER --hold \"reason\""
+      exit 0
+    fi
+    echo "Value Hold ($count)"
+    echo ""
+    jq -r '.[] | "\(.ticker)\t[\(.added)]\tsizing=\(.sizing)\t\(.reason)"' "$HOLD_JSON" \
+      | awk -F'\t' '{printf "  %-6s  %-12s  %-9s  %s\n", $1, $2, $3, $4}'
+    ;;
+
+  brief)
+    TICKER=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker brief TICKER"
+      exit 1
+    fi
+    BRIEF="$RESEARCH_DIR/$TICKER-deep.md"
+    if [[ ! -f "$BRIEF" ]]; then
+      echo "No brief for $TICKER. Run: research run $TICKER"
+      exit 1
+    fi
+    ${PAGER:-less} "$BRIEF"
+    ;;
+
+  size)
+    TICKER=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker size TICKER"
+      exit 1
+    fi
+    BRIEF="$RESEARCH_DIR/$TICKER-deep.md"
+    if [[ ! -f "$BRIEF" ]]; then
+      echo "No brief for $TICKER. Run: research run $TICKER"
+      exit 1
+    fi
+    sizing=$(grep -m1 "Size eligible:" "$BRIEF" 2>/dev/null | sed 's/.*Size eligible:[[:space:]]*//' | tr -d '\r' || true)
+    if [[ -z "$sizing" ]]; then
+      echo "$TICKER: sizing not found in brief (brief may be incomplete)"
+      exit 1
+    fi
+    echo "$TICKER: $sizing"
+    ;;
+
+  publish)
+    TICKER=$(echo "${2:-}" | tr '[:lower:]' '[:upper:]')
+    if [[ -z "$TICKER" ]]; then
+      echo "Usage: locker publish TICKER"
+      exit 1
+    fi
+    BRIEF="$RESEARCH_DIR/$TICKER-deep.md"
+    if [[ ! -f "$BRIEF" ]]; then
+      echo "No brief for $TICKER. Run: research run $TICKER"
+      exit 1
+    fi
+    python3 "$HOME/research/src/research/publish.py" --draft "$BRIEF"
+    ;;
+
+  show|list|ls)
+    exec "$0"
+    ;;
+
+  sizing)
+    python3 -W ignore -m locker.sizing "$BROAD_SCAN_DIR" "${@:2}"
+    ;;
+
+  pick)
+    _momentum_file=$(mktemp)
+    _db_to_json > "$_momentum_file"
+    cd "$BROAD_SCAN_DIR" && python3 -W ignore -m locker.pick --db "$_momentum_file"
+    rm -f "$_momentum_file"
+    ;;
+
+  *)
+    if [[ ! "$CMD" =~ ^[A-Za-z]{1,5}$ ]]; then
+      echo "Unknown command: $CMD"
+      echo "Usage: locker [show|add TICKER|del TICKER|pending|TICKER]"
+      exit 1
+    fi
+    _add "$CMD" "${2:-}" "${3:-}"
+    ;;
+esac

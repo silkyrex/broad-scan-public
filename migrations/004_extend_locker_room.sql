@@ -1,0 +1,12 @@
+ALTER TABLE locker_room ADD COLUMN ema4_status TEXT;
+ALTER TABLE locker_room ADD COLUMN ema4_updated DATE;
+ALTER TABLE locker_room ADD COLUMN position_state TEXT DEFAULT 'watching';
+ALTER TABLE locker_room ADD COLUMN entry_price REAL;
+ALTER TABLE locker_room ADD COLUMN stop_price REAL;
+ALTER TABLE locker_room ADD COLUMN shares REAL;
+ALTER TABLE locker_room ADD COLUMN sector TEXT;
+ALTER TABLE locker_room ADD COLUMN industry TEXT;
+ALTER TABLE locker_room ADD COLUMN market_cap INTEGER;
+ALTER TABLE locker_room ADD COLUMN beta REAL;
+ALTER TABLE locker_room ADD COLUMN short_pct_float REAL;
+ALTER TABLE locker_room ADD COLUMN notes TEXT;

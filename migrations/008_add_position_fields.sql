@@ -1,0 +1,5 @@
+ALTER TABLE positions ADD COLUMN size_type TEXT DEFAULT 'full';
+ALTER TABLE positions ADD COLUMN setup TEXT;
+ALTER TABLE positions ADD COLUMN r_risk REAL;
+ALTER TABLE positions ADD COLUMN mfe REAL;
+ALTER TABLE positions ADD COLUMN mae REAL;

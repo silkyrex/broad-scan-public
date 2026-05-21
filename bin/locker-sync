@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+locker-sync — push locker_room.json to StockCharts [0108] Locker room CLI
+
+SC: pure HTTP via stockcharts.com/json/api (Playwright only for cookie bootstrap)
+
+TV watchlist sync has moved to ~/projects/tradingview-treehouse/sync.py
+
+Usage:
+  locker-sync    sync SC Locker Room (StockCharts only)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+
+LOCKER_JSON  = Path.home() / "projects/do-infra-local/trading/locker_room.json"
+SC_ENV       = Path.home() / ".config/credentials/stockcharts.env"
+SC_CONTEXT   = Path.home() / ".local/share/sc-locker"
+
+SC_BASE      = "https://stockcharts.com/json/api"
+SC_CC        = "1393683"   # chart code from json/api?cmd=get-member
+SC_CC_INT    = int(SC_CC)
+SC_LIST_NAME = "[0108] Locker room CLI"
+
+
+# ── Locker data ───────────────────────────────────────────────────────────────
+
+def load_tickers() -> list[str]:
+    return [e["ticker"] for e in json.loads(LOCKER_JSON.read_text())]
+
+
+# ── StockCharts HTTP helpers ──────────────────────────────────────────────────
+
+def _sc_session() -> requests.Session:
+    """Bootstrap session cookies via Playwright persistent context."""
+    load_dotenv(SC_ENV)
+    email    = os.environ["SC_EMAIL"]
+    password = os.environ["SC_PASSWORD"]
+
+    SC_CONTEXT.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as pw:
+        ctx  = pw.chromium.launch_persistent_context(str(SC_CONTEXT), headless=True, args=["--no-sandbox"])
+        page = ctx.new_page()
+        page.goto("https://stockcharts.com/panels/", wait_until="domcontentloaded")
+        time.sleep(4)
+
+        if page.query_selector("input[name='form_UserID']"):
+            page.fill("input[name='form_UserID']", email)
+            page.fill("input[name='form_UserPassword']", password)
+            cb = page.query_selector("input[name='form_RememberMe']")
+            if cb:
+                cb.check()
+            page.keyboard.press("Enter")
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(4)
+
+        cookies = ctx.cookies()
+        ctx.close()
+
+    s = requests.Session()
+    for c in cookies:
+        s.cookies.set(c["name"], c["value"], domain=c["domain"])
+    s.headers.update({
+        "User-Agent":      "Mozilla/5.0",
+        "Referer":         "https://stockcharts.com/panels/",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    return s
+
+
+def _sc_find_or_create(s: requests.Session) -> int:
+    """Return listNum for SC_LIST_NAME, creating it if absent."""
+    r   = s.get(f"{SC_BASE}?cmd=get-chartlists&cc={SC_CC}", timeout=10)
+    lsts = r.json().get("chartLists", [])
+    for lst in lsts:
+        if lst.get("name") == SC_LIST_NAME:
+            return int(lst["listNum"])
+
+    r2  = s.post(f"{SC_BASE}?cmd=add-chartlist&cc={SC_CC}",
+                 json={"name": SC_LIST_NAME, "chartCode": SC_CC_INT, "notes": ""},
+                 timeout=10)
+    listnum = r2.json()["chartList"]["listNum"]
+    print(f"  SC: created {SC_LIST_NAME!r} as listNum={listnum}")
+    return int(listnum)
+
+
+def _sc_clear(s: requests.Session, listnum: int):
+    r = s.get(f"{SC_BASE}?cmd=get-favorites&cc={SC_CC}&ln={listnum}", timeout=10)
+    for fav in r.json().get("favorites", []):
+        s.post(f"{SC_BASE}?cmd=delete-favorite&cc={SC_CC}",
+               json={"recID": fav["recID"], "listNum": listnum, "chartCode": SC_CC_INT},
+               timeout=5)
+
+
+def _sc_add(s: requests.Session, listnum: int, tickers: list[str]):
+    for ticker in tickers:
+        r = s.post(f"{SC_BASE}?cmd=add-favorite&cc={SC_CC}",
+                   json={"listNum": listnum, "symbol": ticker,
+                         "chartCode": SC_CC_INT, "comments": ""},
+                   timeout=5)
+        if not r.json().get("success"):
+            print(f"  SC: warning — could not add {ticker}", file=sys.stderr)
+
+
+# ── StockCharts sync ──────────────────────────────────────────────────────────
+
+def sync_stockcharts(tickers: list[str]):
+    print("  SC: fetching session...")
+    s       = _sc_session()
+    listnum = _sc_find_or_create(s)
+    print(f"  SC: clearing {SC_LIST_NAME!r} (listNum={listnum})...")
+    _sc_clear(s, listnum)
+    print(f"  SC: adding {len(tickers)} tickers...")
+    _sc_add(s, listnum, tickers)
+
+    r   = s.get(f"{SC_BASE}?cmd=get-favorites&cc={SC_CC}&ln={listnum}", timeout=10)
+    count = len(r.json().get("favorites", []))
+    print(f"  SC: {SC_LIST_NAME!r} now has {count} tickers")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync Locker Room to StockCharts [0108]")
+    parser.parse_args()
+
+    tickers = load_tickers()
+    if len(tickers) == 0:
+        sys.exit("GATE FAIL: locker_room.json is empty -- aborting sync to protect SC list")
+    print(f"Locker Room: {len(tickers)} tickers -- {' '.join(tickers)}")
+    print("\nSyncing StockCharts...")
+    try:
+        sync_stockcharts(tickers)
+    except Exception as e:
+        print(f"  SC error: {e}", file=sys.stderr)
+
+    print("\nDone.")
+    print("Note: TV watchlist sync moved to ~/projects/tradingview-treehouse/sync.py")
+
+
+if __name__ == "__main__":
+    main()

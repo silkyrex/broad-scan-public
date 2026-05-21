@@ -1,0 +1,9 @@
+{
+  "equity": 100000,
+  "regime_entry_pct": {
+    "BULL": 20,
+    "CHOP": 15,
+    "BEAR": 10
+  },
+  "pyramid_max_pct": 25
+}

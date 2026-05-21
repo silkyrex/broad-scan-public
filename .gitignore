@@ -1,0 +1,7 @@
+broad-scan.db
+.env
+data/
+__pycache__/
+*.pyc
+.claude/
+ob1_last_seen.json
